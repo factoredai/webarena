@@ -14,6 +14,7 @@ from browser_env.constants import (
     IGNORED_ACTREE_PROPERTIES,
     UTTERANCE_MAX_LENGTH,
 )
+from browser_env.async_wrapper import AsyncWrapper
 
 from .utils import (
     AccessibilityTree,
@@ -65,6 +66,8 @@ class TextObervationProcessor(ObservationProcessor):
         client: CDPSession,
     ) -> BrowserInfo:
         # extract domtree
+        if client is None:
+            return {}
         tree = client.send(
             "DOMSnapshot.captureSnapshot",
             {
@@ -73,6 +76,7 @@ class TextObervationProcessor(ObservationProcessor):
                 "includePaintOrder": True,
             },
         )
+
 
         # calibrate the bounds, in some cases, the bounds are scaled somehow
         bounds = tree["documents"][0]["layout"]["bounds"]
@@ -580,12 +584,12 @@ class TextObervationProcessor(ObservationProcessor):
 
         return "\n".join(clean_lines)
 
-    def process(self, page: Page, client: CDPSession) -> str:
+    def process(self, page: AsyncWrapper[Page], client: AsyncWrapper[CDPSession]) -> str:
         # get the tab info
         open_tabs = page.context.pages
         try:
             tab_titles = [tab.title() for tab in open_tabs]
-            current_tab_idx = open_tabs.index(page)
+            current_tab_idx = [tab.unwrap() for tab in open_tabs].index(page.unwrap())
             for idx in range(len(open_tabs)):
                 if idx == current_tab_idx:
                     tab_titles[
@@ -711,8 +715,17 @@ class ObservationHandler:
     def get_observation(
         self, page: Page, client: CDPSession
     ) -> dict[str, Observation]:
-        text_obs = self.text_processor.process(page, client)
-        image_obs = self.image_processor.process(page, client)
+        try:
+            text_obs = self.text_processor.process(page, client)
+        except (TypeError, AttributeError):
+            text_obs = ""
+        try:
+            image_obs = self.image_processor.process(page, client)
+        except (TypeError, AttributeError):
+            image_obs = np.zeros(
+                (self.viewport_size["height"], self.viewport_size["width"], 3),
+                dtype=np.uint8,
+            )
         return {"text": text_obs, "image": image_obs}
 
     def get_observation_metadata(self) -> dict[str, ObservationMetadata]:

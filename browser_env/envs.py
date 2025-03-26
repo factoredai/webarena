@@ -12,14 +12,37 @@ from beartype import beartype
 from beartype.door import is_bearable
 from gymnasium import Env
 from gymnasium.spaces import Box, Text
-from playwright.sync_api import (
-    CDPSession,
-    Page,
-    Playwright,
-    ViewportSize,
-    expect,
-    sync_playwright,
-)
+
+from browser_env.async_wrapper import AsyncWrapper
+
+import asyncio
+import nest_asyncio
+nest_asyncio.apply()
+
+
+LOOP = asyncio._get_running_loop()
+if LOOP is not None:
+    IS_ASYNC = True
+    from playwright.async_api import (
+        CDPSession,
+        Page,
+        Playwright,
+        ViewportSize,
+        expect,
+        async_playwright as playwright_ct,
+    )
+else:
+    # from playwright.sync_api import (
+    IS_ASYNC = False
+    from playwright.sync_api import (
+        CDPSession,
+        Page,
+        Playwright,
+        ViewportSize,
+        expect,
+        sync_playwright as playwright_ct,
+    )
+
 
 from .actions import Action, execute_action, get_action_space
 from .processors import ObservationHandler, ObservationMetadata
@@ -109,13 +132,13 @@ class ScriptBrowserEnv(Env[dict[str, Observation], Action]):
                     f"Unsupported observation type: {observation_type}"
                 )
 
-        self.observation_handler = ObservationHandler(
+        self.observation_handler = AsyncWrapper(ObservationHandler(
             self.main_observation_type,
             self.text_observation_type,
             self.image_observation_type,
             self.current_viewport_only,
             self.viewport_size,
-        )
+        ))
 
         self.observation_space = (
             self.observation_handler.get_observation_space()
@@ -123,11 +146,22 @@ class ScriptBrowserEnv(Env[dict[str, Observation], Action]):
 
     @beartype
     def setup(self, config_file: Path | None = None) -> None:
-        self.context_manager = sync_playwright()
-        self.playwright = self.context_manager.__enter__()
-        self.browser = self.playwright.chromium.launch(
-            headless=self.headless, slow_mo=self.slow_mo
-        )
+        self.context_manager = AsyncWrapper(playwright_ct())
+        self.playwright = AsyncWrapper(self.context_manager.start())
+        self.browser = AsyncWrapper(self.playwright.chromium.launch(headless=self.headless, slow_mo=self.slow_mo))
+        # if IS_ASYNC:
+
+        #     self.playwright = LOOP.run_until_complete(self.context_manager.start())
+        #     self.browser = LOOP.run_until_complete(
+        #         self.playwright.chromium.launch(
+        #             headless=self.headless, slow_mo=self.slow_mo
+        #         )
+        #     )
+        # else:
+        #     self.playwright = self.context_manager.start()
+        #     self.browser = self.playwright.chromium.launch(
+        #         headless=self.headless, slow_mo=self.slow_mo
+        #     )
 
         if config_file:
             with open(config_file, "r") as f:
@@ -139,37 +173,57 @@ class ScriptBrowserEnv(Env[dict[str, Observation], Action]):
         start_url = instance_config.get("start_url", None)
         geolocation = instance_config.get("geolocation", None)
 
-        self.context = self.browser.new_context(
+        self.context = AsyncWrapper(self.browser.new_context(
             viewport=self.viewport_size,
             storage_state=storage_state,
             geolocation=geolocation,
             device_scale_factor=1,
-        )
+        ))
+        # if IS_ASYNC:
+        #     self.context = LOOP.run_until_complete(
+        #         self.browser.new_context(
+        #             viewport=self.viewport_size,
+        #             storage_state=storage_state,
+        #             geolocation=geolocation,
+        #             device_scale_factor=1,
+        #         )
+        #     )
+        # else:
+        #     self.context = self.browser.new_context(
+        #         viewport=self.viewport_size,
+        #         storage_state=storage_state,
+        #         geolocation=geolocation,
+        #         device_scale_factor=1,
+        #     )
+
         if self.save_trace_enabled:
             self.context.tracing.start(screenshots=True, snapshots=True)
         if start_url:
             start_urls = start_url.split(" |AND| ")
             for url in start_urls:
-                page = self.context.new_page()
-                client = page.context.new_cdp_session(
-                    page
-                )  # talk to chrome devtools
+                page = AsyncWrapper(self.context.new_page())
+                client = AsyncWrapper(page.context.new_cdp_session(
+                    page.unwrap()
+                ))  # talk to chrome devtools
                 if self.text_observation_type == "accessibility_tree":
                     client.send("Accessibility.enable")
-                page.client = client  # type: ignore # TODO[shuyanzh], fix this hackey client
+                page.unwrap().client = client  # type: ignore # TODO[shuyanzh], fix this hackey client
                 page.goto(url)
             # set the first page as the current page
             self.page = self.context.pages[0]
             self.page.bring_to_front()
         else:
-            self.page = self.context.new_page()
-            client = self.page.context.new_cdp_session(self.page)
+            self.page = AsyncWrapper(self.context.new_page())
+            client = AsyncWrapper(self.page.context.new_cdp_session(self.page._obj))
             if self.text_observation_type == "accessibility_tree":
                 client.send("Accessibility.enable")
-            self.page.client = client  # type: ignore
+            self.page._obj.client = client  # type: ignore
 
     def get_page_client(self, page: Page) -> CDPSession:
-        return page.client  # type: ignore
+        try:
+            return page.client  # type: ignore
+        except AttributeError:
+            return None
 
     def _get_obs(self) -> dict[str, Observation]:
         obs = self.observation_handler.get_observation(
@@ -194,8 +248,7 @@ class ScriptBrowserEnv(Env[dict[str, Observation], Action]):
             - "storage_state": the storage state of the browser. It is a file path to a json file.
         """
         super().reset(seed=seed, options=options)
-        if self.reset_finished:
-            self.context_manager.__exit__()
+        self.close()
 
         if options is not None and "config_file" in options:
             config_file = Path(options["config_file"])
@@ -226,7 +279,11 @@ class ScriptBrowserEnv(Env[dict[str, Observation], Action]):
 
     def close(self) -> None:
         if self.reset_finished:
-            self.context_manager.__exit__()
+            if IS_ASYNC:
+                self.context_manager.__aexit__()
+            else:
+                self.context_manager.__exit__()
+
 
     def step(
         self, action: Action
